@@ -1,0 +1,102 @@
+#include <DS1302RTC.h>
+#include <TimeLib.h>
+#include <EEPROM.h>
+
+// Stepper config
+int port[4] = {5, 4, 3, 2};  // Change if needed
+int seq[8][4] = {
+  {LOW, HIGH, HIGH, LOW},
+  {LOW, LOW, HIGH, LOW},
+  {LOW, LOW, HIGH, HIGH},
+  {LOW, LOW, LOW, HIGH},
+  {HIGH, LOW, LOW, HIGH},
+  {HIGH, LOW, LOW, LOW},
+  {HIGH, HIGH, LOW, LOW},
+  {LOW, HIGH, LOW, LOW}
+};
+
+int normalDelay = 92;      // For real-time ticking
+int fastDelay = 3;         // For fast startup adjustment
+long stepsPer12Hours = 56320;  // Total steps for 12 hours (your calibration)
+int lastStepAddress = 0;       // EEPROM address for step storage
+long currentStep = 0;
+
+void rotate(long steps, int delayTime) {
+  static int phase = 0;
+  int delta = (steps > 0) ? 1 : 7;
+  steps = abs(steps);
+
+  for (long j = 0; j < steps; j++) {
+    phase = (phase + delta) % 8;
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(port[i], seq[phase][i]);
+    }
+    delay(delayTime);
+  }
+  // Cut motor power
+  for (int i = 0; i < 4; i++) digitalWrite(port[i], LOW);
+}
+
+void storeSteps(long steps) {
+  EEPROM.put(lastStepAddress, steps);
+}
+
+long loadSteps() {
+  long stored;
+  EEPROM.get(lastStepAddress, stored);
+  return stored;
+}
+
+long computeStepsFromTime(int hr, int min) {
+  hr = hr % 12;
+  return (long)((((hr * 60) + min) / 720.0) * stepsPer12Hours);
+}
+
+void setup() {
+  for (int i = 0; i < 4; i++) pinMode(port[i], OUTPUT);
+  Serial.begin(9600);
+  setSyncProvider(RTC.get);
+
+  if (timeStatus() != timeSet) {
+    Serial.println("Unable to sync with RTC");
+    while (1);
+  }
+
+  long storedSteps = loadSteps();
+  int hr = hour();
+  int mn = minute();
+  long targetSteps = computeStepsFromTime(hr, mn);
+
+  // Estimate startup adjustment lag
+  long stepDiff = targetSteps - storedSteps;
+  long lagMillis = abs(stepDiff) * fastDelay;
+  int lagMinutes = lagMillis / 60000;
+
+  // Recompute targetSteps to include lag
+  mn += lagMinutes;
+  if (mn >= 60) { hr++; mn -= 60; }
+  targetSteps = computeStepsFromTime(hr, mn);
+  stepDiff = targetSteps - storedSteps;
+
+  Serial.print("Adjusting from step "); Serial.print(storedSteps);
+  Serial.print(" to "); Serial.println(targetSteps);
+
+  if (stepDiff != 0) rotate(stepDiff, fastDelay);
+
+  currentStep = targetSteps;
+  storeSteps(currentStep);  // Save updated position
+}
+
+void loop() {
+  rotate(1, normalDelay);
+  currentStep++;
+  if (currentStep >= stepsPer12Hours) currentStep = 0;
+
+  // Save step count every minute (about every 65 steps)
+  static int tickCount = 0;
+  tickCount++;
+  if (tickCount >= 65) {
+    storeSteps(currentStep);
+    tickCount = 0;
+  }
+}
