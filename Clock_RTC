@@ -1,9 +1,16 @@
-#include <DS1302RTC.h>
-#include <TimeLib.h>
+#include <Arduino.h>
+#include <Ds1302.h>
 #include <EEPROM.h>
 
-// Stepper config
-int port[4] = {5, 4, 3, 2};  // Change if needed
+// RTC Pins
+#define PIN_ENA 8
+#define PIN_CLK 6
+#define PIN_DAT 7
+
+// Stepper motor pins
+int port[4] = {5, 4, 3, 2};
+
+// Stepper motor 8-step sequence
 int seq[8][4] = {
   {LOW, HIGH, HIGH, LOW},
   {LOW, LOW, HIGH, LOW},
@@ -15,12 +22,34 @@ int seq[8][4] = {
   {LOW, HIGH, LOW, LOW}
 };
 
-int normalDelay = 92;      // For real-time ticking
-int fastDelay = 3;         // For fast startup adjustment
-long stepsPer12Hours = 56320;  // Total steps for 12 hours (your calibration)
-int lastStepAddress = 0;       // EEPROM address for step storage
-long currentStep = 0;
+const int normalDelay = 92; // Slow ticking delay (ms)
+const int fastDelay = 1;    // Fast stepping delay (ms)
+const long stepsPer12Hours = 56320; // Motor steps for 12 hours
 
+Ds1302 rtc(PIN_ENA, PIN_CLK, PIN_DAT);
+
+long currentStep = 0;  // Motor step position, saved in EEPROM
+
+// Compute motor steps from time (hour and minute)
+long computeStepsFromTime(int hr, int min) {
+  hr = hr % 12;
+  return (long)((((hr * 60) + min) / 720.0) * stepsPer12Hours);
+}
+
+// Save motor step position to EEPROM address 0
+void storeSteps(long steps) {
+  EEPROM.put(0, steps);
+}
+
+// Load motor step position from EEPROM address 0
+long loadSteps() {
+  long stored = 0;
+  EEPROM.get(0, stored);
+  if (stored < 0 || stored > stepsPer12Hours) return 0;
+  return stored;
+}
+
+// Rotate motor steps (positive or negative) with specified delay
 void rotate(long steps, int delayTime) {
   static int phase = 0;
   int delta = (steps > 0) ? 1 : 7;
@@ -33,70 +62,100 @@ void rotate(long steps, int delayTime) {
     }
     delay(delayTime);
   }
-  // Cut motor power
-  for (int i = 0; i < 4; i++) digitalWrite(port[i], LOW);
-}
 
-void storeSteps(long steps) {
-  EEPROM.put(lastStepAddress, steps);
-}
-
-long loadSteps() {
-  long stored;
-  EEPROM.get(lastStepAddress, stored);
-  return stored;
-}
-
-long computeStepsFromTime(int hr, int min) {
-  hr = hr % 12;
-  return (long)((((hr * 60) + min) / 720.0) * stepsPer12Hours);
+  // Turn off motor coils to prevent heating
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(port[i], LOW);
+  }
 }
 
 void setup() {
-  for (int i = 0; i < 4; i++) pinMode(port[i], OUTPUT);
   Serial.begin(9600);
-  setSyncProvider(RTC.get);
 
-  if (timeStatus() != timeSet) {
-    Serial.println("Unable to sync with RTC");
-    while (1);
+  // Setup motor pins
+  for (int i = 0; i < 4; i++) {
+    pinMode(port[i], OUTPUT);
+    digitalWrite(port[i], LOW);
   }
 
-  long storedSteps = loadSteps();
-  int hr = hour();
-  int mn = minute();
-  long targetSteps = computeStepsFromTime(hr, mn);
+  rtc.init();
 
-  // Estimate startup adjustment lag
-  long stepDiff = targetSteps - storedSteps;
-  long lagMillis = abs(stepDiff) * fastDelay;
-  int lagMinutes = lagMillis / 60000;
+  currentStep = loadSteps();
 
-  // Recompute targetSteps to include lag
-  mn += lagMinutes;
-  if (mn >= 60) { hr++; mn -= 60; }
-  targetSteps = computeStepsFromTime(hr, mn);
-  stepDiff = targetSteps - storedSteps;
-
-  Serial.print("Adjusting from step "); Serial.print(storedSteps);
-  Serial.print(" to "); Serial.println(targetSteps);
-
-  if (stepDiff != 0) rotate(stepDiff, fastDelay);
-
-  currentStep = targetSteps;
-  storeSteps(currentStep);  // Save updated position
+  Serial.println(F("Stepper RTC Clock Ready."));
+  Serial.println(F("Type 'SET HH MM' to set time, e.g. 'SET 10 30'"));
+  Serial.println(F("Or just wait to run clock ticking..."));
 }
 
 void loop() {
+  // Check Serial input for time set command
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("SET")) {
+      int h, m;
+      int count = sscanf(line.c_str(), "SET %d %d", &h, &m);
+      if (count == 2 && h >= 0 && h < 24 && m >= 0 && m < 60) {
+        // Get current date/time but replace hour/minute/second
+        Ds1302::DateTime dt;
+        rtc.getDateTime(&dt);
+        dt.hour = h;
+        dt.minute = m;
+        dt.second = 0;
+
+        // Set RTC time
+        rtc.setDateTime(&dt);
+
+        Serial.print(F("Time set to "));
+        Serial.print(h);
+        Serial.print(":");
+        if (m < 10) Serial.print('0');
+        Serial.println(m);
+
+        // Move motor fast to correct position
+        long targetSteps = computeStepsFromTime(h, m);
+        long diffSteps = targetSteps - currentStep;
+        Serial.print(F("Moving motor fast to position: "));
+        Serial.println(targetSteps);
+        rotate(diffSteps, fastDelay);
+
+        currentStep = targetSteps;
+        storeSteps(currentStep);
+      } else {
+        Serial.println(F("Invalid command. Use: SET HH MM (24h format)"));
+      }
+    } else {
+      Serial.println(F("Unknown command."));
+    }
+  }
+
+  // Normal slow ticking: move motor 1 step every loop cycle
   rotate(1, normalDelay);
   currentStep++;
   if (currentStep >= stepsPer12Hours) currentStep = 0;
 
-  // Save step count every minute (about every 65 steps)
-  static int tickCount = 0;
-  tickCount++;
-  if (tickCount >= 65) {
+  // Save current step to EEPROM every ~1 minute (~65 steps)
+  static int tickCounter = 0;
+  tickCounter++;
+  if (tickCounter >= 65) {
     storeSteps(currentStep);
-    tickCount = 0;
+    tickCounter = 0;
+  }
+
+  // Print current RTC time every 10 seconds for monitoring
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 10000) {
+    Ds1302::DateTime now;
+    rtc.getDateTime(&now);
+    Serial.print(F("RTC Time: "));
+    if (now.hour < 10) Serial.print('0');
+    Serial.print(now.hour);
+    Serial.print(":");
+    if (now.minute < 10) Serial.print('0');
+    Serial.print(now.minute);
+    Serial.print(":");
+    if (now.second < 10) Serial.print('0');
+    Serial.println(now.second);
+    lastPrint = millis();
   }
 }
